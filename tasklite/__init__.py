@@ -5,51 +5,68 @@ from typing import Callable, List
 import uuid
 
 
+_SQL_SCHEMAS = {
+    'message': """(
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            description TEXT,
+            dt_created TEXT,
+            queue TEXT,
+            args TEXT,
+            kwargs TEXT
+        )
+        """,
+    'queue': """(
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            queue TEXT,
+            args TEXT,
+            kwargs TEXT
+        )
+        """,
+    'result': """(
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            status TEXT,
+            result TEXT,
+            dt_created TEXT,
+            dt_done TEXT,
+            error TEXT,
+            traceback TEXT
+        )
+        """,
+}
+
+
 class Task:
+    def __init__(self, func: Callable, name: str | None = None):
+        self.func = func
+        self.name = name or func.__name__
+
+    def __call__(self, *args, **kwargs):
+        return self.func(*args, **kwargs)
+
+
+class Worker:
     def __init__(self):
-        ...
+        self.available: bool = True
+
+    def run_task(self, task: Task, *args, **kwargs):
+        """
+        Starts a new process, executes the task and store the result into the db
+        """
 
 
 class TaskLite:
-    _schemas = {
-        'message': """
-            CREATE TABLE IF NOT EXISTS message (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                description TEXT,
-                dt_created TEXT,
-                queue TEXT,
-                args TEXT,
-                kwargs TEXT
-            )
-            """,
-        'queue': """
-            CREATE TABLE IF NOT EXISTS queue (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                queue TEXT,
-                args TEXT,
-                kwargs TEXT
-            )
-            """,
-        'result': """
-            CREATE TABLE IF NOT EXISTS results (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                status TEXT,
-                result TEXT,
-                dt_created TEXT,
-                dt_done TEXT,
-                error TEXT,
-                traceback TEXT
-            )
-            """,
-    }
-
     def __init__(
-        self, tasks: List[Callable], workers: int = 4, db_url: str = 'tasklite.db'
+        self,
+        tasks: list[Callable] | list[Task],
+        workers: int = 4,
+        db_url: str = 'tasklite.db',
     ):
-        self.tasks = {func.__name__: func for func in tasks}
+        tasks = [Task(task) if not isinstance(task, Task) else task for task in tasks]
+
+        self.tasks = tasks
         self.nworkers = workers
         self.db_url = db_url
         self.connection = sqlite3.connect(self.db_url, check_same_thread=False)
@@ -62,13 +79,21 @@ class TaskLite:
         self.available_workers = self.manager.list([True] * self.nworkers)
 
     def _init_db(self):
-        for sql in self._schemas.values():
+        for table, schema in _SQL_SCHEMAS.items():
+            sql = f'CREATE TABLE IF NOT EXISTS {table} {schema}'
             self.cursor.execute(sql)
         self.connection.commit()
 
     def _get_db_queue(self):
         self.cursor.execute('SELECT * FROM queue')
         return self.cursor.fetchall()
+
+    def _get_task_func(self, task_name: str) -> Callable:
+        for task in self.tasks:
+            if task.name == task_name:
+                return task.func
+        else:
+            raise ValueError(f'task {task_name} not in tasklite')
 
     def queue_task(self, name: str, description=None, queue: int = 1, *args, **kwargs):
         task_id = str(uuid.uuid4())
@@ -108,7 +133,7 @@ class TaskLite:
             task = self._get_db_queue()
             if task:
                 task_id, name, _, args, kwargs = task[0]
-                func = self.tasks[name]
+                func = self._get_task_func(name)
                 worker_index = self.available_workers.index(True)
                 self.available_workers[worker_index] = False
                 process = Process(
@@ -116,7 +141,6 @@ class TaskLite:
                     args=(task_id, func, args, kwargs, self.db_url),
                 )
                 process.start()
-                # process.join()
                 self.available_workers[worker_index] = True
                 self.cursor.execute('DELETE FROM queue WHERE id = ?', (task_id,))
                 self.connection.commit()
@@ -135,7 +159,7 @@ def _execute_task(task_id, func, args, kwargs, db_url):
     conn = sqlite3.connect(db_url)
     cursor = conn.cursor()
     try:
-        result = func(args, **kwargs)
+        result = func(*args, **kwargs)
         status = 'success'
         traceback = None
     except Exception as e:
