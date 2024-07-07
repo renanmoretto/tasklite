@@ -20,6 +20,9 @@ ignore_*
 _old*
 .coverage
 htmlcov
-_*
 *.db
 .vscode
+
+# dev testing
+_test.py
+_app.py
