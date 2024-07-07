@@ -24,7 +24,7 @@ _SQL_SCHEMAS = {
             kwargs TEXT
         )
         """,
-    'result': """(
+    'results': """(
             id TEXT PRIMARY KEY,
             name TEXT,
             status TEXT,
@@ -48,13 +48,84 @@ class Task:
 
 
 class Worker:
-    def __init__(self):
-        self.available: bool = True
+    def __init__(self, number: int, availability):
+        self.number = number
+        self.available = availability
+        # self.available: bool = True
 
-    def run_task(self, task: Task, *args, **kwargs):
-        """
-        Starts a new process, executes the task and store the result into the db
-        """
+        print(f'worker {self.number} ok')
+
+    def __str__(self):
+        return f'worker{self.number}'
+
+    def __repr__(self):
+        return f'worker{self.number}'
+
+    def _execute_task(
+        self,
+        task_id: str,
+        task_name: str,
+        func: Callable,
+        db_url: str,
+        *args,
+        **kwargs,
+    ):
+        dt_started = time.strftime('%Y-%m-%d %H:%M:%S')
+        conn = sqlite3.connect(db_url)
+        cursor = conn.cursor()
+
+        try:
+            # result = func(*args, **kwargs)
+            result = func()
+            status = 'SUCCESS'
+            error = None
+            traceback = None
+        except Exception as e:
+            result = None
+            status = 'FAILED'
+            error = str(e)
+            traceback = str(e)
+
+        dt_done = time.strftime('%Y-%m-%d %H:%M:%S')
+
+        cursor.execute(
+            """
+            INSERT INTO results (id, name, status, result, dt_created, dt_done, error, traceback)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+            (
+                task_id,
+                task_name,
+                status,
+                str(result),
+                dt_started,
+                dt_done,
+                error,
+                traceback,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        # self.available = True
+        self.available[self.number - 1] = True
+
+    def run_task(
+        self,
+        task_id: str,
+        task_name: str,
+        func: Callable,
+        db_url: str,
+        *args,
+        **kwargs,
+    ):
+        # self.available = False
+        print(self, f'executing task {task_name}')
+        self.available[self.number - 1] = False
+        process = Process(
+            target=self._execute_task,
+            args=(task_id, task_name, func, db_url, args, kwargs),
+        )
+        process.start()
 
 
 class TaskLite:
@@ -67,16 +138,23 @@ class TaskLite:
         tasks = [Task(task) if not isinstance(task, Task) else task for task in tasks]
 
         self.tasks = tasks
-        self.nworkers = workers
         self.db_url = db_url
+        self._nworkers = workers
         self.connection = sqlite3.connect(self.db_url, check_same_thread=False)
         self.cursor = self.connection.cursor()
         self._init_db()
 
     def init(self):
         self.manager = Manager()
+        self.availability = self.manager.list([True] * self._nworkers)
         self.queue = self.manager.Queue()
-        self.available_workers = self.manager.list([True] * self.nworkers)
+        self.workers = [Worker(i + 1, self.availability) for i in range(self._nworkers)]
+
+    @property
+    def available_workers(self):
+        return [
+            worker for worker in self.workers if self.availability[worker.number - 1]
+        ]
 
     def _init_db(self):
         for table, schema in _SQL_SCHEMAS.items():
@@ -129,21 +207,27 @@ class TaskLite:
         self.connection.commit()
 
     def run_pending(self):
-        if any(self.available_workers):
-            task = self._get_db_queue()
-            if task:
-                task_id, name, _, args, kwargs = task[0]
-                func = self._get_task_func(name)
-                worker_index = self.available_workers.index(True)
-                self.available_workers[worker_index] = False
-                process = Process(
-                    target=_execute_task,
-                    args=(task_id, func, args, kwargs, self.db_url),
-                )
-                process.start()
-                self.available_workers[worker_index] = True
-                self.cursor.execute('DELETE FROM queue WHERE id = ?', (task_id,))
-                self.connection.commit()
+        available_workers = self.available_workers
+        if available_workers:
+            tasks_to_execute = self._get_db_queue()[: len(available_workers)]
+            print(tasks_to_execute)
+            print(len(tasks_to_execute))
+            print(available_workers)
+            if tasks_to_execute:
+                for task, worker in zip(tasks_to_execute, available_workers):
+                    task_id, name, _, args, kwargs = task
+                    func = self._get_task_func(name)
+                    worker.run_task(
+                        task_id=task_id,
+                        task_name=name,
+                        func=func,
+                        db_url=self.db_url,
+                        args=args,
+                        kwargs=kwargs,
+                    )
+
+                    self.cursor.execute('DELETE FROM queue WHERE id = ?', (task_id,))
+                    self.connection.commit()
         else:
             print('Waiting for available workers')
 
@@ -152,37 +236,3 @@ class TaskLite:
         self.cursor.execute('DELETE FROM queue')
         self.cursor.execute('DELETE FROM results')
         self.connection.commit()
-
-
-def _execute_task(task_id, func, args, kwargs, db_url):
-    dt_started = time.strftime('%Y-%m-%d %H:%M:%S')
-    conn = sqlite3.connect(db_url)
-    cursor = conn.cursor()
-    try:
-        result = func(*args, **kwargs)
-        status = 'success'
-        traceback = None
-    except Exception as e:
-        result = None
-        status = 'failed'
-        error = str(e)
-        traceback = str(e)
-    dt_done = time.strftime('%Y-%m-%d %H:%M:%S')
-    cursor.execute(
-        """
-        INSERT INTO results (id, name, status, result, dt_created, dt_done, error, traceback)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-        (
-            task_id,
-            func.__name__,
-            status,
-            str(result),
-            dt_started,
-            dt_done,
-            error,
-            traceback,
-        ),
-    )
-    conn.commit()
-    conn.close()
