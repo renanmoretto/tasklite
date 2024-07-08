@@ -3,7 +3,7 @@ import time
 import datetime
 from multiprocessing import Manager, Process, Value
 import ctypes
-from typing import Callable
+from typing import Callable, Any
 import uuid
 import traceback
 
@@ -42,6 +42,82 @@ _SQL_SCHEMAS = {
 }
 
 
+class Database:
+    def __init__(self, db_url: str):
+        self.db_url = db_url
+        self.connection = sqlite3.connect(self.db_url, check_same_thread=False)
+        self.cursor = self.connection.cursor()
+        self._init_db()
+
+    def _init_db(self):
+        for table, schema in _SQL_SCHEMAS.items():
+            sql = f'CREATE TABLE IF NOT EXISTS {table} {schema}'
+            self.cursor.execute(sql)
+        self.connection.commit()
+
+    def insert_message(
+        self, task_id, name, description, dt_created, queue, args, kwargs
+    ):
+        self.cursor.execute(
+            """
+            INSERT INTO message (id, name, description, dt_created, queue, args, kwargs)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (task_id, name, description, dt_created, queue, args, kwargs),
+        )
+        self.connection.commit()
+
+    def insert_queue(self, task_id, name, queue, args, kwargs):
+        self.cursor.execute(
+            """
+            INSERT INTO queue (id, name, queue, args, kwargs)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (task_id, name, queue, args, kwargs),
+        )
+        self.connection.commit()
+
+    def insert_result(
+        self,
+        task_id: str,
+        task_name: str,
+        status: str,
+        result: Any,
+        dt_started: datetime.datetime,
+        dt_done: datetime.datetime,
+        execution_time: float,
+        error: str | None,
+        tb: str | None,
+    ):
+        self.cursor.execute(
+            """
+            INSERT INTO results 
+            (id, name, status, result, dt_created, dt_done, execution_time, error, traceback)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                task_name,
+                status,
+                str(result),
+                dt_started.strftime('%Y-%m-%d %H:%M:%S'),
+                dt_done.strftime('%Y-%m-%d %H:%M:%S'),
+                execution_time,
+                error,
+                tb,
+            ),
+        )
+        self.connection.commit()
+
+    def delete_from_queue(self, task_id):
+        self.cursor.execute('DELETE FROM queue WHERE id = ?', (task_id,))
+        self.connection.commit()
+
+    def fetch_queue(self):
+        self.cursor.execute('SELECT * FROM queue')
+        return self.cursor.fetchall()
+
+
 class Task:
     def __init__(self, func: Callable, name: str | None = None):
         self.func = func
@@ -55,7 +131,6 @@ class Worker:
     def __init__(self, number: int):
         self.number = number
         self.available = Value(ctypes.c_bool, True)
-        # self.available: bool = True
 
         print(f'worker {self.number} ok')
 
@@ -75,11 +150,10 @@ class Worker:
         **kwargs,
     ):
         dt_started = datetime.datetime.now()
-        conn = sqlite3.connect(db_url)
-        cursor = conn.cursor()
+        db = Database(db_url)
 
         try:
-            # result = func(*args, **kwargs)
+            # result = func(*args, **kwargs) # FIXME
             result = func()
             status = 'SUCCESS'
             error = None
@@ -99,28 +173,17 @@ class Worker:
         else:
             print(f'[{self}][{task_id}] {task_name} failed in {execution_time}s')
 
-        cursor.execute(
-            """
-            INSERT INTO results 
-            (id, name, status, result, dt_created, dt_done, execution_time, error, traceback)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                task_name,
-                status,
-                str(result),
-                dt_started.strftime('%Y-%m-%d %H:%M:%S'),
-                dt_done.strftime('%Y-%m-%d %H:%M:%S'),
-                execution_time,
-                error,
-                tb,
-            ),
+        db.insert_result(
+            task_id,
+            task_name,
+            status,
+            str(result),
+            dt_started,
+            dt_started,
+            execution_time,
+            error,
+            tb,
         )
-        conn.commit()
-        conn.close()
-        # self.available = True
-        # self.available[self.number - 1] = True
         self.available.value = True
 
     def run_task(
@@ -132,9 +195,8 @@ class Worker:
         *args,
         **kwargs,
     ):
-        # self.available = False
-        print(self, f'Executing task {task_name}')
         self.available.value = False
+        print(self, f'Executing task {task_name}')
         process = Process(
             target=self._execute_task,
             args=(task_id, task_name, func, db_url, args, kwargs),
@@ -154,10 +216,8 @@ class TaskLite:
         self.tasks = tasks
         self.db_url = db_url
         self._nworkers = workers
-        self.connection = sqlite3.connect(self.db_url, check_same_thread=False)
-        self.cursor = self.connection.cursor()
+        self.db = Database(self.db_url)
         self.active_processes = []
-        self._init_db()
 
     def init(self):
         self.manager = Manager()
@@ -168,16 +228,6 @@ class TaskLite:
     def available_workers(self):
         return [worker for worker in self.workers if worker.available.value]
 
-    def _init_db(self):
-        for table, schema in _SQL_SCHEMAS.items():
-            sql = f'CREATE TABLE IF NOT EXISTS {table} {schema}'
-            self.cursor.execute(sql)
-        self.connection.commit()
-
-    def _get_db_queue(self):
-        self.cursor.execute('SELECT * FROM queue')
-        return self.cursor.fetchall()
-
     def _get_task_func(self, task_name: str) -> Callable:
         for task in self.tasks:
             if task.name == task_name:
@@ -187,40 +237,28 @@ class TaskLite:
     def queue_task(self, name: str, description=None, queue: int = 1, *args, **kwargs):
         task_id = str(uuid.uuid4())
         dt_created = time.strftime('%Y-%m-%d %H:%M:%S')
-        self.cursor.execute(
-            """
-            INSERT INTO message (id, name, description, dt_created, queue, args, kwargs)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                task_id,
-                name,
-                description,
-                dt_created,
-                name,
-                None if not args else str(args),
-                None if not args else str(kwargs),
-            ),
+        self.db.insert_message(
+            task_id,
+            name,
+            description,
+            dt_created,
+            name,
+            None if not args else str(args),
+            None if not args else str(kwargs),
         )
-        self.cursor.execute(
-            """
-            INSERT INTO queue (id, name, queue, args, kwargs)
-            VALUES (?, ?, ?, ?, ?)
-        """,
-            (
-                task_id,
-                name,
-                queue,
-                None if not args else str(args),
-                None if not args else str(kwargs),
-            ),
+        self.db.insert_queue(
+            task_id,
+            name,
+            queue,
+            None if not args else str(args),
+            None if not args else str(kwargs),
         )
-        self.connection.commit()
 
     def run_pending(self):
         available_workers = self.available_workers
         if available_workers:
-            tasks_to_execute = self._get_db_queue()[: len(available_workers)]
+            queue = self.db.fetch_queue()
+            tasks_to_execute = queue[: len(available_workers)]
             if tasks_to_execute:
                 for task, worker in zip(tasks_to_execute, available_workers):
                     task_id, name, _, args, kwargs = task
@@ -234,14 +272,12 @@ class TaskLite:
                         kwargs=kwargs,
                     )
 
-                    self.cursor.execute('DELETE FROM queue WHERE id = ?', (task_id,))
-                    self.connection.commit()
+                    self.db.delete_from_queue(task_id)
         else:
-            # print('Waiting for available workers')
             ...
 
     def flush_db(self):
-        self.cursor.execute('DELETE FROM message')
-        self.cursor.execute('DELETE FROM queue')
-        self.cursor.execute('DELETE FROM results')
-        self.connection.commit()
+        self.db.cursor.execute('DELETE FROM message')
+        self.db.cursor.execute('DELETE FROM queue')
+        self.db.cursor.execute('DELETE FROM results')
+        self.db.connection.commit()
