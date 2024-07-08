@@ -1,7 +1,8 @@
 import sqlite3
 import time
 import datetime
-from multiprocessing import Manager, Process
+from multiprocessing import Manager, Process, Value
+import ctypes
 from typing import Callable
 import uuid
 import traceback
@@ -51,9 +52,9 @@ class Task:
 
 
 class Worker:
-    def __init__(self, number: int, availability):
+    def __init__(self, number: int):
         self.number = number
-        self.available = availability
+        self.available = Value(ctypes.c_bool, True)
         # self.available: bool = True
 
         print(f'worker {self.number} ok')
@@ -119,7 +120,8 @@ class Worker:
         conn.commit()
         conn.close()
         # self.available = True
-        self.available[self.number - 1] = True
+        # self.available[self.number - 1] = True
+        self.available.value = True
 
     def run_task(
         self,
@@ -132,13 +134,12 @@ class Worker:
     ):
         # self.available = False
         print(self, f'Executing task {task_name}')
-        self.available[self.number - 1] = False
+        self.available.value = False
         process = Process(
             target=self._execute_task,
             args=(task_id, task_name, func, db_url, args, kwargs),
         )
         process.start()
-        self.process = process
 
 
 class TaskLite:
@@ -160,15 +161,12 @@ class TaskLite:
 
     def init(self):
         self.manager = Manager()
-        self.availability = self.manager.list([True] * self._nworkers)
         self.queue = self.manager.Queue()
-        self.workers = [Worker(i + 1, self.availability) for i in range(self._nworkers)]
+        self.workers = [Worker(i + 1) for i in range(self._nworkers)]
 
     @property
     def available_workers(self):
-        return [
-            worker for worker in self.workers if self.availability[worker.number - 1]
-        ]
+        return [worker for worker in self.workers if worker.available.value]
 
     def _init_db(self):
         for table, schema in _SQL_SCHEMAS.items():
@@ -227,7 +225,7 @@ class TaskLite:
                 for task, worker in zip(tasks_to_execute, available_workers):
                     task_id, name, _, args, kwargs = task
                     func = self._get_task_func(name)
-                    process = worker.run_task(
+                    worker.run_task(
                         task_id=task_id,
                         task_name=name,
                         func=func,
