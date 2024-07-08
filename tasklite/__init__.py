@@ -4,10 +4,10 @@ import datetime
 import ctypes
 import uuid
 import traceback
-import pickle
 
 from typing import Callable, Any
 from multiprocessing import Manager, Process, Value
+
 
 _DEFAULT_DB_URL = 'tasklite.db'
 _SQL_SCHEMAS = {
@@ -48,7 +48,6 @@ class Database:
     def __init__(self, db_url: str, timeout: int = 10):
         self.db_url = db_url
         self.connection = sqlite3.connect(self.db_url, timeout=timeout)
-        # self.connection.execute('pragma journal_mode=wal;')
         self.cursor = self.connection.cursor()
         self._init_db()
 
@@ -345,11 +344,3 @@ class TaskLite:
         while True:
             self.run_pending()
             time.sleep(self.loop_interval)
-
-
-def task_it(tasklite: TaskLite):
-    def decorator(func: Callable):
-        tasklite.add_task(func)
-        return Task(func)
-
-    return decorator
