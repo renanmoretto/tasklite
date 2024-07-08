@@ -235,8 +235,8 @@ class Worker:
         task_name: str,
         func: Callable,
         db_url: str,
-        *args,
-        **kwargs,
+        *args,  # TODO
+        **kwargs,  # TODO
     ):
         self.available.value = False
         print(self, f'Executing task {task_name}')
@@ -250,14 +250,12 @@ class Worker:
 class TaskLite:
     def __init__(
         self,
-        tasks: list[Task] | None = None,
         workers: int = 4,
         db_url: str = _DEFAULT_DB_URL,
         loop_interval: float = 0.1,
     ):
         self._nworkers = workers
-        self.tasks = tasks or []
-        self.tasks_funcs = {}
+        self.tasks = {}
         self.db_url = db_url
         self.db = None
         self.db = self.get_db()
@@ -275,17 +273,13 @@ class TaskLite:
 
     def add_task(self, task: Callable):
         _task = Task(task, db_url=self.db_url)
-        self.tasks.append(_task)
-        self.tasks_funcs.update({_task.name: _task.func})
+        self.tasks.update({_task.name: _task})
+
+    def get_task(self, task_name: str) -> Task:
+        return self.tasks[task_name]
 
     def get_db(self) -> Database:
         return self.db or Database(self.db_url)
-
-    def _get_task_func(self, task_name: str) -> Callable:
-        for task in self.tasks:
-            if task.name == task_name:
-                return task.func
-        raise ValueError(f'Task {task_name} not found in TaskLite')
 
     def queue_task(
         self,
@@ -317,7 +311,7 @@ class TaskLite:
             if tasks_to_execute:
                 for task, worker in zip(tasks_to_execute, available_workers):
                     task_id, name, _, args, kwargs = task
-                    func = self._get_task_func(name)
+                    func = self.get_task(name).func
                     worker.run_task(
                         task_id=task_id,
                         task_name=name,
