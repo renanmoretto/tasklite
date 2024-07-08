@@ -1,13 +1,15 @@
 import sqlite3
 import time
 import datetime
-from multiprocessing import Manager, Process, Value
 import ctypes
-from typing import Callable, Any
 import uuid
 import traceback
+import pickle
 
+from typing import Callable, Any
+from multiprocessing import Manager, Process, Value
 
+_DEFAULT_DB_URL = 'tasklite.db'
 _SQL_SCHEMAS = {
     'message': """(
             id TEXT PRIMARY KEY,
@@ -46,6 +48,7 @@ class Database:
     def __init__(self, db_url: str, timeout: int = 10):
         self.db_url = db_url
         self.connection = sqlite3.connect(self.db_url, timeout=timeout)
+        # self.connection.execute('pragma journal_mode=wal;')
         self.cursor = self.connection.cursor()
         self._init_db()
 
@@ -55,8 +58,15 @@ class Database:
             self.cursor.execute(sql)
         self.connection.commit()
 
-    def insert_message(
-        self, task_id, name, description, dt_created, queue, args, kwargs
+    def _insert_message(
+        self,
+        task_id,
+        name,
+        description,
+        dt_created,
+        queue,
+        args,
+        kwargs,
     ):
         self.cursor.execute(
             """
@@ -67,7 +77,19 @@ class Database:
         )
         self.connection.commit()
 
-    def insert_queue(self, task_id, name, queue, args, kwargs):
+    def insert_queue(
+        self,
+        task_id,
+        name,
+        queue,
+        description,
+        dt_created,
+        args,
+        kwargs,
+    ):
+        self._insert_message(
+            task_id, name, description, dt_created, queue, args, kwargs
+        )
         self.cursor.execute(
             """
             INSERT INTO queue (id, name, queue, args, kwargs)
@@ -119,12 +141,36 @@ class Database:
 
 
 class Task:
-    def __init__(self, func: Callable, name: str | None = None):
+    def __init__(
+        self,
+        func: Callable,
+        db_url: str = _DEFAULT_DB_URL,
+        name: str | None = None,
+        description: str | None = None,
+        queue: int = 1,
+    ):
         self.func = func
         self.name = name or func.__name__
+        self.db_url = db_url
+        self.description = description
+        self.priority_queue = queue
 
     def __call__(self, *args, **kwargs):
         return self.func(*args, **kwargs)
+
+    def queue(self, *args, **kwargs):
+        db = Database(self.db_url)
+        task_id = str(uuid.uuid4())
+        dt_created = time.strftime('%Y-%m-%d %H:%M:%S')
+        db.insert_queue(
+            task_id=task_id,
+            name=self.name,
+            queue=self.priority_queue,
+            description=self.description,
+            dt_created=dt_created,
+            args=None if not args else str(args),
+            kwargs=None if not kwargs else str(kwargs),
+        )
 
 
 class Worker:
@@ -146,8 +192,6 @@ class Worker:
         task_name: str,
         func: Callable,
         db_url: str,
-        *args,
-        **kwargs,
     ):
         dt_started = datetime.datetime.now()
         db = Database(db_url)
@@ -199,7 +243,7 @@ class Worker:
         print(self, f'Executing task {task_name}')
         process = Process(
             target=self._execute_task,
-            args=(task_id, task_name, func, db_url, args, kwargs),
+            args=(task_id, task_name, func, db_url),
         )
         process.start()
 
@@ -207,17 +251,19 @@ class Worker:
 class TaskLite:
     def __init__(
         self,
-        tasks: list[Callable] | list[Task],
+        tasks: list[Task] | None = None,
         workers: int = 4,
-        db_url: str = 'tasklite.db',
+        db_url: str = _DEFAULT_DB_URL,
+        loop_interval: float = 0.1,
     ):
-        tasks = [Task(task) if not isinstance(task, Task) else task for task in tasks]
-
-        self.tasks = tasks
-        self.db_url = db_url
         self._nworkers = workers
-        self.db = Database(self.db_url)
+        self.tasks = tasks or []
+        self.tasks_funcs = {}
+        self.db_url = db_url
+        self.db = None
+        self.db = self.get_db()
         self.active_processes = []
+        self.loop_interval = loop_interval
 
     def init(self):
         self.manager = Manager()
@@ -228,36 +274,46 @@ class TaskLite:
     def available_workers(self):
         return [worker for worker in self.workers if worker.available.value]
 
+    def add_task(self, task: Callable):
+        _task = Task(task, db_url=self.db_url)
+        self.tasks.append(_task)
+        self.tasks_funcs.update({_task.name: _task.func})
+
+    def get_db(self) -> Database:
+        return self.db or Database(self.db_url)
+
     def _get_task_func(self, task_name: str) -> Callable:
         for task in self.tasks:
             if task.name == task_name:
                 return task.func
         raise ValueError(f'Task {task_name} not found in TaskLite')
 
-    def queue_task(self, name: str, description=None, queue: int = 1, *args, **kwargs):
+    def queue_task(
+        self,
+        name: str,
+        description: str | None = None,
+        priority_queue: int = 1,
+        *args,
+        **kwargs,
+    ):
         task_id = str(uuid.uuid4())
         dt_created = time.strftime('%Y-%m-%d %H:%M:%S')
-        self.db.insert_message(
-            task_id,
-            name,
-            description,
-            dt_created,
-            name,
-            None if not args else str(args),
-            None if not args else str(kwargs),
-        )
-        self.db.insert_queue(
-            task_id,
-            name,
-            queue,
-            None if not args else str(args),
-            None if not args else str(kwargs),
+        db = self.get_db()
+        db.insert_queue(
+            task_id=task_id,
+            name=name,
+            queue=priority_queue,
+            description=description,
+            dt_created=dt_created,
+            args=None if not args else str(args),
+            kwargs=None if not kwargs else str(kwargs),
         )
 
     def run_pending(self):
+        db = self.get_db()
         available_workers = self.available_workers
         if available_workers:
-            queue = self.db.fetch_queue()
+            queue = db.fetch_queue()
             tasks_to_execute = queue[: len(available_workers)]
             if tasks_to_execute:
                 for task, worker in zip(tasks_to_execute, available_workers):
@@ -272,12 +328,28 @@ class TaskLite:
                         kwargs=kwargs,
                     )
 
-                    self.db.delete_from_queue(task_id)
+                    db.delete_from_queue(task_id)
         else:
             ...
 
     def flush_db(self):
-        self.db.cursor.execute('DELETE FROM message')
-        self.db.cursor.execute('DELETE FROM queue')
-        self.db.cursor.execute('DELETE FROM results')
-        self.db.connection.commit()
+        db = self.get_db()
+        db.cursor.execute('DELETE FROM message')
+        db.cursor.execute('DELETE FROM queue')
+        db.cursor.execute('DELETE FROM results')
+        db.connection.commit()
+
+    def run(self):
+        self.init()
+
+        while True:
+            self.run_pending()
+            time.sleep(self.loop_interval)
+
+
+def task_it(tasklite: TaskLite):
+    def decorator(func: Callable):
+        tasklite.add_task(func)
+        return Task(func)
+
+    return decorator
