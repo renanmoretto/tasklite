@@ -43,9 +43,9 @@ _SQL_SCHEMAS = {
 
 
 class Database:
-    def __init__(self, db_url: str):
+    def __init__(self, db_url: str, timeout: int = 10):
         self.db_url = db_url
-        self.connection = sqlite3.connect(self.db_url, check_same_thread=False)
+        self.connection = sqlite3.connect(self.db_url, timeout=timeout)
         self.cursor = self.connection.cursor()
         self._init_db()
 
